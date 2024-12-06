@@ -39,32 +39,29 @@ class nav_simple(Node):
     def __del__(self):
         self.get_logger().info("Nav_Simple Killed!")
     def callback(self, data):
-    #    print("callback!!!")
-#        new_direction = np.array(data.name)
-#        new_range = np.array(data.position)
-#        new_angle = np.array(data.velocity)
-#        new_certainty = np.array(data.effort)
-#        np_certainty = np.array(self.arrow_certainty)
-#        np_range = np.array(self.arrow_range)
-#        np_angle = np.array(self.arrow_angle)
-#        np_direction = np.array(self.arrow_direction)
-
-  #      for c in range(len(self.tracked_arrows)):
-  #          for c2 in range(len(data.position)):
-   #             if(abs(self.tracked_arrows[c].range - data.position[c2]) < 0.2 
-  #              and abs(self.tracked_arrows[c].angle - data.velocity[c2]) < 5.0 
-   #             and self.tracked_arrows[c].direction == data.name[c2]):
-                    #assume its the same arrow
-   #                 self.tracked_arrows[c].range = data.position[ind]
-   #                 self.tracked_arrows[c].range = data.position[ind]
-
         self.arrow_direction = data.name
         self.arrow_range = data.position
         self.arrow_angle = data.velocity
         self.arrow_certainty = data.effort
     def callback_2(self, data):
-    #    print("callback2!")
         self.autonomus_mode = data.position[list(data.name).index('autonomous_mode')]
+    def arrow_filter(self, range_min, range_max, angle_max, certainty_min):
+        if(len(self.arrow_range) > 0):
+            np_cert = np.array(self.arrow_certainty)
+            np_range = np.array(self.arrow_range)
+            np_angle = np.array(self.arrow_angle)
+            np_mask = np_range > range_min
+            np_mask3 = np_range < range_max
+            np_mask2 = np.abs(np_angle) < angle_max
+            new_mask = np.logical_and(np.logical_and(np_mask, np_mask2), np_mask3)
+            np_cert_filtered = np_cert[new_mask]
+            np_range_filtered = np_range[new_mask]
+            np_angle_filtered = np_angle[new_mask]
+            if(len(np_cert_filtered) > 0):
+                index = np.argmax(np_cert_filtered)
+                if(np_cert_filtered[index] > certainty_min):
+                    return (np_range_filtered[index], np_angle_filtered[index], np_cert_filtered[index])
+        return None
     def find_arrow(self):
         message = Twist()
         direction = 1   #default direction
@@ -81,30 +78,7 @@ class nav_simple(Node):
         message.linear.x = float(direction * 0.05)
         self.pub.publish(message)
         # spin until an arrow far away is detected and it is centered in the frame
-        while(detection < 1 and self.autonomus_mode == 1):
-            if(len(self.arrow_certainty) > 0):
-                np_cert = np.array(self.arrow_certainty)
-                np_range = np.array(self.arrow_range)
-                np_angle = np.array(self.arrow_angle)
-                np_mask = np_range > 2.0
-                np_mask2 = np.abs(np_angle) < 15.0 
-                np_cert_filtered = np_cert[np.logical_and(np_mask, np_mask2)]
-                np_range_filtered = np_range[np.logical_and(np_mask, np_mask2)]
-                np_angle_filtered = np_angle[np.logical_and(np_mask, np_mask2)]
-                if(len(np_cert_filtered) > 0):
-                    index = np.argmax(np_cert_filtered)
-                    if(np_cert_filtered[index] > 0.6):
-                        detection = 1
-                        self.maximum_range = np_range_filtered[index]
-            self.pub.publish(message)
-            time.sleep(0.1)
-        while(detection < 1 and self.autonomus_mode == 1):
-            print(self.arrow_range)
-            for c in range(len(self.arrow_range)):
-                if(self.arrow_range[c] > 2.0 and self.arrow_certainty[c] > 0.6 and abs(self.arrow_angle[c]) < 15.0):
-                    detection += 1
-                    self.maximum_range = self.arrow_range[c]
-                    break
+        while(self.arrow_filter(2, 10, 15, .6) == None and self.autonomus_mode == 1):
             self.pub.publish(message)
             time.sleep(0.1)
         #stop spinning
@@ -120,21 +94,32 @@ class nav_simple(Node):
         arrival = 0
         error = 0
         counter = 0
+        lost_ctr = 0
         while(arrival < 1 and self.autonomus_mode == 1):
             print(self.arrow_angle)
             #check if we arrived
-            for c in range(len(self.arrow_range)):
-                #need to drive for at least 3 seconds before the next stop
-                if(self.arrow_range[c] < 1.5 and self.arrow_range[c] > 1.0 and counter > 50 and self.arrow_certainty[c] > 0.5):
-                    print("Arrived!")
-                    print(self.arrow_range[c])
-                    time.sleep(5)
-                    arrival = 1
-                    break
+            arrow = self.arrow_filter(1.0, 1.5, 100, .6)
+            if(arrow != None):
+                print("Arrived!")
+                print(arrow[0])
+                time.sleep(5)
+                arrival = 1
+                break
             #if not arrived, update the angle error
-            for c in range(len(self.arrow_range)):
-                if(self.arrow_range[c] > 1.5 and self.arrow_range[c] < self.maximum_range and self.arrow_certainty[c] > 0.5):
-                    error = self.arrow_angle[c]
+            arrow = self.arrow_filter(1.5, self.maximum_range, 100, .6)
+            if (arrow != None):
+                lost_ctr = 0
+                self.maximum_range = arrow[0] + 0.5
+                error = arrow[1]
+            else:
+                #if arrow is lost stop and start search again
+                lost_ctr += 1
+            if(lost_ctr > 10):
+                message.linear.x = 0.0
+                message.angular.z = 0.0
+                self.pub.publish(message)
+                print("Arrow Lost!!!")
+                return
             message.angular.z = float(-error * self.p_gain)
             self.pub.publish(message)
             counter += 1
