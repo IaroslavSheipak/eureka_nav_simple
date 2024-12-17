@@ -33,7 +33,7 @@ class nav_simple(Node):
         self.arrow_angle = list()
         self.arrow_range = list()
         self.arrow_certainty = list()
-        self.tracked_arrows = list()
+        self.spin_direction = 'left'
         self.maximum_range = 10.0
         self.get_logger().info("Nav_Simple Started!")
     def __del__(self):
@@ -50,6 +50,7 @@ class nav_simple(Node):
             np_cert = np.array(self.arrow_certainty)
             np_range = np.array(self.arrow_range)
             np_angle = np.array(self.arrow_angle)
+            np_direction = np.array(self.arrow_direction)
             np_mask = np_range > range_min
             np_mask3 = np_range < range_max
             np_mask2 = np.abs(np_angle) < angle_max
@@ -57,12 +58,14 @@ class nav_simple(Node):
             np_cert_filtered = np_cert[new_mask]
             np_range_filtered = np_range[new_mask]
             np_angle_filtered = np_angle[new_mask]
+            np_direction_filtered = np_direction[new_mask]
             if(len(np_cert_filtered) > 0):
                 index = np.argmax(np_cert_filtered)
                 if(np_cert_filtered[index] > certainty_min):
-                    return (np_range_filtered[index], np_angle_filtered[index], np_cert_filtered[index])
+                    return (np_range_filtered[index], np_angle_filtered[index], np_cert_filtered[index], np_direction[index])
         return None
     def find_arrow(self):
+        detection_ctr = 0
         message = Twist()
         direction = 1   #default direction
         detection = 0   
@@ -72,17 +75,26 @@ class nav_simple(Node):
             if(self.arrow_range[c] < 2.0):
                 if (self.arrow_direction[c] == 'right' and self.arrow_certainty[c] > 0.5): 
                     print("Right arrow!")
-                    direction = -1
+                    self.spin_direction = 'right'
                 break
+        if(self.spin_direction == 'right'):
+            direction = -1
         message.angular.z = 100.0
         message.linear.x = float(direction * 0.05)
         self.pub.publish(message)
         # spin until an arrow far away is detected and it is centered in the frame
-        while(self.arrow_filter(2, 10, 15, .6) == None and self.autonomus_mode == 1):
+        arrow = None
+        while(detection_ctr < 10 and self.autonomus_mode == 1):
+            arrow = self.arrow_filter(2, 10, 15, .6)
+            if(arrow == None):
+                detection_ctr = 0
+            detection_ctr += 1
             self.pub.publish(message)
             time.sleep(0.1)
         #stop spinning
-        
+        if arrow is not None:
+            self.maximum_range = arrow[0] + 0.5
+            self.minimum_range = arrow[0] - 0.5
         message.linear.x = 0.0
         message.angular.z = 0.0
         self.pub.publish(message)
@@ -95,21 +107,25 @@ class nav_simple(Node):
         error = 0
         counter = 0
         lost_ctr = 0
+        self.maximum_range = 10
+        self.minimum_range = 0
         while(arrival < 1 and self.autonomus_mode == 1):
             print(self.arrow_angle)
             #check if we arrived
             arrow = self.arrow_filter(1.0, 1.5, 100, .6)
-            if(arrow != None):
+            if(arrow != None and self.maximum_range < 2.0):
+                self.spin_direction = arrow[3]
                 print("Arrived!")
                 print(arrow[0])
                 time.sleep(5)
                 arrival = 1
                 break
             #if not arrived, update the angle error
-            arrow = self.arrow_filter(1.5, self.maximum_range, 100, .6)
+            arrow = self.arrow_filter(self.minimum_range, self.maximum_range, 100, .6)
             if (arrow != None):
                 lost_ctr = 0
                 self.maximum_range = arrow[0] + 0.5
+                self.minimum_range = arrow[0] - 0.5
                 error = arrow[1]
             else:
                 #if arrow is lost stop and start search again
@@ -118,6 +134,7 @@ class nav_simple(Node):
                 message.linear.x = 0.0
                 message.angular.z = 0.0
                 self.pub.publish(message)
+                print(self.maximum_range)
                 print("Arrow Lost!!!")
                 return
             message.angular.z = float(-error * self.p_gain)

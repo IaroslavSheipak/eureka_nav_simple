@@ -27,6 +27,7 @@ class CV_detect(Node):
         self.timer = self.create_timer(0.0, self.callback)
         self.bridge = CvBridge()
         self.image_flag = 0
+        self.vertical_offset = 60
     def image_callback(self, msg):
         self.image_flag = 1
         self.frame = self.bridge.imgmsg_to_cv2(msg)
@@ -40,7 +41,7 @@ class CV_detect(Node):
         frame_full = cv2.resize(self.frame, (640, 480))
         width = self.frame.shape[0]
         height = self.frame.shape[1]
-        frame_cut = self.frame[ int(width/2-480/2): int(width/2 + 480/2) ,int(height/2 - 640/2):int(height/2 + 640/2)]
+        frame_cut = self.frame[ int(width/2-480/2 - self.vertical_offset): int(width/2 + 480/2 - self.vertical_offset) ,int(height/2 - 640/2):int(height/2 + 640/2)]
 
         processed_frame, arrow_info = self.process_frame(frame_full, frame_cut, 640/1920, 480/1080)
         for info in arrow_info:
@@ -59,6 +60,8 @@ class CV_detect(Node):
         
         ros_frame = self.bridge.cv2_to_imgmsg(processed_frame, encoding='rgb8')
         self.publisher_box_full.publish(ros_frame)
+        ros_frame = self.bridge.cv2_to_imgmsg(frame_cut, encoding='rgb8')
+        self.publisher_box_cut.publish(ros_frame)
 
        
 
@@ -127,9 +130,12 @@ class CV_detect(Node):
                 temp[2]+=640 
                 temp[2]*=ratio_hor
                 temp[1]+=300
+                temp[1] -=  self.vertical_offset
                 temp[1]*=ratio_vert
                 temp[3]+=300
+                temp[3] -=  self.vertical_offset
                 temp[3]*=ratio_vert
+                
                 boxes_new.append(tuple(map(int, temp)))
 
         #print(confidences)
@@ -142,64 +148,65 @@ class CV_detect(Node):
         print(boxes)
         for box, conf in zip(boxes, confidences):
             x1, y1, x2, y2 = box
-            arrow_roi = img[y1:y2, x1:x2]
-            length = x2 - x1  # Width of the bounding box
-            height = y2 - y1  # Height of the bounding box
-            inclination_angle = self.calculate_inclination_angle(length, height)
-            angle = self.calculate_angle(box, cx, cy)
-            distance = self.estimate_distance(height, self.reference_heights, self.reference_distances)
-            direction = self.determine_arrow_direction(arrow_roi)
-            arrow_info.append((box, angle, distance, direction, inclination_angle, conf))
-            if conf > 0.75:
-                color = (0, 255, 0)  # Green
-            elif conf > 0.5:
-                color = (0, 255, 255)  # Yellow
-            else:
-                color = (0, 0, 255)  # Red
+            if(not(x1 < 10 or x2 > 630 or y1 < 10 or y2 > 470)):
+                arrow_roi = img[y1:y2, x1:x2]
+                length = x2 - x1  # Width of the bounding box
+                height = y2 - y1  # Height of the bounding box
+                inclination_angle = self.calculate_inclination_angle(length, height)
+                angle = self.calculate_angle(box, cx, cy)
+                distance = self.estimate_distance(height, self.reference_heights, self.reference_distances)
+                direction = self.determine_arrow_direction(arrow_roi)
+                arrow_info.append((box, angle, distance, direction, inclination_angle, conf))
+                if conf > 0.75:
+                    color = (0, 255, 0)  # Green
+                elif conf > 0.5:
+                    color = (0, 255, 255)  # Yellow
+                else:
+                    color = (0, 0, 255)  # Red
 
-        # Drawing the bounding box
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            # Drawing the bounding box
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
-        # Create label with direction and confidence
-            label = f"{direction.capitalize()} Arrow {conf:.2f}"
+            # Create label with direction and confidence
+                label = f"{direction.capitalize()} Arrow {conf:.2f}"
 
-        # Choose font and get text size
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.5
-            thickness = 1
-            (label_width, label_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            # Choose font and get text size
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.5
+                thickness = 1
+                (label_width, label_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
 
-        # Calculate label position
-            label_x = x1
-            label_y = y1 - 10 if y1 - 10 > label_height else y1 + label_height + 10
+            # Calculate label position
+                label_x = x1
+                label_y = y1 - 10 if y1 - 10 > label_height else y1 + label_height + 10
 
-        # Draw filled rectangle as background for label
-            cv2.rectangle(img, (label_x, label_y - label_height - baseline),
-                      (label_x + label_width, label_y + baseline), color, cv2.FILLED)
+            # Draw filled rectangle as background for label
+                cv2.rectangle(img, (label_x, label_y - label_height - baseline),
+                        (label_x + label_width, label_y + baseline), color, cv2.FILLED)
 
-        # Put label text above the bounding box
-            cv2.putText(img, label, (label_x, label_y),
-                    font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            # Put label text above the bounding box
+                cv2.putText(img, label, (label_x, label_y),
+                        font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
-        # (Optional) Draw additional annotations below the box
-        # You can adjust or remove these as needed
-            additional_info = (
-            f"Angle: {angle:.1f}°",
-            f"Incl: {inclination_angle:.1f}°",
-            f"Dist: {distance:.2f}m"
-        )
-            for i, info in enumerate(additional_info):
-                text = info
-                text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
-                text_x = x1
-                text_y = y2 + 20 + i * 20  # Start 20 pixels below the box
-            # Ensure text stays within frame
-                text_y = min(text_y, img_height - 10)
-                cv2.putText(img, text, (text_x, text_y),
-                        font, font_scale, color, thickness, cv2.LINE_AA)
+            # (Optional) Draw additional annotations below the box
+            # You can adjust or remove these as needed
+                additional_info = (
+                f"Angle: {angle:.1f}°",
+                f"Incl: {inclination_angle:.1f}°",
+                f"Dist: {distance:.2f}m"
+            )
+                for i, info in enumerate(additional_info):
+                    text = info
+                    text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
+                    text_x = x1
+                    text_y = y2 + 20 + i * 20  # Start 20 pixels below the box
+                # Ensure text stays within frame
+                    text_y = min(text_y, img_height - 10)
+                    cv2.putText(img, text, (text_x, text_y),
+                            font, font_scale, color, thickness, cv2.LINE_AA)
 
-        # (Optional) Print confidence to console
-            print(f"Detected {direction} arrow with confidence {conf:.2f}")
+            # (Optional) Print confidence to console
+                print(f"Detected {direction} arrow with confidence {conf:.2f}")
 
         return img, arrow_info
     
