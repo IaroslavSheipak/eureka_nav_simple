@@ -17,8 +17,8 @@ class CV_detect(Node):
         self.publisher_ = self.create_publisher(JointState, 'arrow_detection',10)
         self.publisher_box_full = self.create_publisher(Image, 'arrow_box_full/image_raw',10)
         self.publisher_box_cut = self.create_publisher(Image, 'arrow_box_cut/image_raw',10)
-        self.subscriber = self.create_subscription(Image, "hazcam/image_raw", self.image_callback, 10)
-        self.model = YOLO('/home/eurekanuc/ros2_ws/src/eureka_nav_simple/eureka_nav_simple/weights/best.pt')
+        self.subscriber = self.create_subscription(Image, "/arena_camera/images", self.image_callback, 10)
+        self.model = YOLO('./weights/best.pt')
         self.reference_distances = [0.5, 1, 2, 4, 8]  # in meters
         self.reference_heights = [125, 94, 63, 31, 15]   # in pixels at 2m and 4m respectively
         self.original_aspect_ratio = 1.7
