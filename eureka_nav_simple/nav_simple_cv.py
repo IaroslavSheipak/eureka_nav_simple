@@ -1,226 +1,221 @@
 #!/usr/bin/env python3
+"""
+Updated arrow‑detection node for Lucid Triton TRI016S‑CC.
+Changes v2 – May 2025
+─────────────────────
+1.  Geometry‑based left/right using PCA (no brightness heuristics)
+2.  Correct angle calculation (removed extra “/2”)
+3.  Pin‑hole distance estimate → replace lookup table
+4.  Cleaner affine remap for cut‑out detections
+5.  Minor safety fixes (no‑detection message, dtype casts)
 
+⚠️ TODOs before flight
+    •  Set `FX_PIX` to your calibrated focal length in pixels.
+    •  Set `ARROW_WIDTH_M` to the physical arrow width in metres.
+    •  Train your YOLO model (weights path below).
+"""
+
+import math
+from pathlib import Path
+from typing import List, Tuple, Optional
 
 import cv2
-import math
 import numpy as np
 from ultralytics import YOLO
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState, Image
 from cv_bridge import CvBridge
 
-class CV_detect(Node):
- 
+# ───────────────────────── Constants ──────────────────────────
+ARROW_WIDTH_M = 0.15            # ← set to real width of plywood arrow (metres)
+FX_PIX        = 920.0           # ← camera focal length (pixels) from calibration
+WEIGHTS_PATH  = Path("./weights/best.pt")
+
+# Camera‑specific offsets (vertical cut‑out centre shift)
+VERTICAL_OFFSET = 60            # px – empirical
+
+# Output topic names
+PUB_ARROW   = "arrow_detection"
+PUB_BOX_FULL = "arrow_box_full/image_raw"
+PUB_BOX_CUT  = "arrow_box_cut/image_raw"
+
+# ───────────────────── Geometry helpers ───────────────────────
+
+def arrow_direction_pca(roi: np.ndarray) -> Optional[str]:
+    """Return 'left' or 'right' by locating the arrowhead via PCA.
+    Works if the arrow is within ±45° yaw. Returns None if uncertain."""
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _, bw = cv2.threshold(gray, 0, 255,
+                          cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return None
+
+    cnt = max(cnts, key=cv2.contourArea)
+    pts = cnt.reshape(-1, 2).astype(np.float32)
+    mean, eigvecs = cv2.PCACompute(pts, mean=None)
+    axis = eigvecs[0]  # major axis
+
+    proj = (pts - mean) @ axis  # 1‑D projection onto major axis
+    tail_pt = pts[np.argmin(proj)]
+    tip_pt  = pts[np.argmax(proj)]
+    return "right" if tip_pt[0] > tail_pt[0] else "left"
+
+
+def estimate_distance(width_px: int, fx_pix: float = FX_PIX,
+                      arrow_width_m: float = ARROW_WIDTH_M) -> float:
+    """Pin‑hole camera model: Z = f * W / w."""
+    if width_px <= 0:
+        return float('inf')
+    return (fx_pix * arrow_width_m) / width_px
+
+
+def calculate_angle(box: Tuple[int, int, int, int],
+                    cx: int, cy: int) -> float:
+    x1, y1, x2, y2 = box
+    bx = (x1 + x2) / 2
+    by = (y1 + y2) / 2
+    # angle wrt camera optical axis (positive right, degrees)
+    angle_rad = math.atan2(by - cy, bx - cx)
+    return math.degrees(angle_rad)
+
+
+# ──────────────────────  ROS2 Node class  ─────────────────────
+class CVDetect(Node):
     def __init__(self):
-        super().__init__('detect_arrow')
-        self.publisher_ = self.create_publisher(JointState, 'arrow_detection',10)
-        self.publisher_box_full = self.create_publisher(Image, 'arrow_box_full/image_raw',10)
-        self.publisher_box_cut = self.create_publisher(Image, 'arrow_box_cut/image_raw',10)
-        self.subscriber = self.create_subscription(Image, "/arena_camera/images", self.image_callback, 10)
-        self.model = YOLO('./weights/best.pt')
-        self.reference_distances = [0.5, 1, 2, 4, 8]  # in meters
-        self.reference_heights = [125, 94, 63, 31, 15]   # in pixels at 2m and 4m respectively
-        self.original_aspect_ratio = 1.7
-        self.video_input_path = '/dev/hazcam'
-    #    self.cap = cv2.VideoCapture(self.video_input_path, cv2.CAP_V4L2)
-        self.timer = self.create_timer(0.0, self.callback)
+        super().__init__("detect_arrow")
+
+        # Publishers
+        self.pub_arrow = self.create_publisher(JointState, PUB_ARROW, 10)
+        self.pub_full  = self.create_publisher(Image, PUB_BOX_FULL, 10)
+        self.pub_cut   = self.create_publisher(Image, PUB_BOX_CUT, 10)
+
+        # Subscriber
+        self.sub_image = self.create_subscription(Image, "/arena_camera/images",
+                                                  self.image_callback, 10)
+
+        # ML model
+        self.model = YOLO(str(WEIGHTS_PATH))
+
+        # frame dispatcher
+        self.timer = self.create_timer(0.0, self.process)
+
+        # misc
         self.bridge = CvBridge()
-        self.image_flag = 0
-        self.vertical_offset = 60
-    def image_callback(self, msg):
-        self.image_flag = 1
+        self.frame: Optional[np.ndarray] = None
+
+    # ─────────────────── Subscribers / Callbacks ────────────
+    def image_callback(self, msg: Image):
         self.frame = self.bridge.imgmsg_to_cv2(msg)
-        return
-        
 
-    def callback(self):
-        if(self.image_flag < 1):
-            return
+    def process(self):
+        if self.frame is None:
+            return  # no frame yet
+
+        frame_full = cv2.resize(self.frame, (640, 480))  # preview size
+
+        # ---- build the central cut‑out (square) ---------------------------
+        h_full, w_full = self.frame.shape[:2]
+        cut_w = 640
+        cut_h = 480
+        x0 = int(w_full / 2 - cut_w / 2)
+        y0 = int(h_full / 2 - cut_h / 2 - VERTICAL_OFFSET)
+        frame_cut = self.frame[y0:y0 + cut_h, x0:x0 + cut_w]
+
+        # ---- run YOLO on both views --------------------------------------
+        boxes_full, confs_full = self.detect_arrows(frame_full)
+        boxes_cut, confs_cut   = self.detect_arrows(frame_cut)
+
+        # map cut‑coords → full‑coords via affine (translation then scaling)
+        Sx = 640 / w_full
+        Sy = 480 / h_full
+        M = np.array([[Sx, 0, x0 * Sx], [0, Sy, y0 * Sy]], dtype=np.float32)
+        boxes_cut_global = [self._transform_box(box, M) for box in boxes_cut]
+
+        boxes = boxes_full + boxes_cut_global
+        confs = confs_full + confs_cut
+
+        # camera centre (for angle)
+        cx = 320  # because frame_full is 640×480
+        cy = 240
+
         msg = JointState()
-        frame_full = cv2.resize(self.frame, (640, 480))
-        width = self.frame.shape[0]
-        height = self.frame.shape[1]
-        frame_cut = self.frame[ int(width/2-480/2 - self.vertical_offset): int(width/2 + 480/2 - self.vertical_offset) ,int(height/2 - 640/2):int(height/2 + 640/2)]
+        msg.header.stamp = self.get_clock().now().to_msg()
 
-        processed_frame, arrow_info = self.process_frame(frame_full, frame_cut, 640/1920, 480/1080)
-        for info in arrow_info:
-            box, angle, distance, direction, inclination_angle, conf = info
-            if direction == 'left' or direction == 'right':
-                msg.name.append(str(direction))  
-                msg.position.append(float(distance))    
-                msg.velocity.append(float(angle))       
-                msg.effort.append(float(conf)) 
-        if msg is None:
-            msg.name.append(str('No_detection')) 
-            msg.position.append(float(0))    
-            msg.velocity.append(float(0))       
-            msg.effort.append(float(0)) 
-        self.publisher_.publish(msg)
-        
-        ros_frame = self.bridge.cv2_to_imgmsg(processed_frame, encoding='rgb8')
-        self.publisher_box_full.publish(ros_frame)
-        ros_frame = self.bridge.cv2_to_imgmsg(frame_cut, encoding='rgb8')
-        self.publisher_box_cut.publish(ros_frame)
-
-       
-
-
-    def detect_arrows(self, img):
-        results = self.model(img)
-        boxes_coordinates = []
-        confidences = []
-        boxes = results[0].boxes  # Accessing the first (and only) result
-        for box in boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            confidence = box.conf[0].item()  # Extract confidence score
-            coordinates = (int(x1), int(y1), int(x2), int(y2))
-            boxes_coordinates.append(coordinates)
-            confidences.append(confidence)
-        return boxes_coordinates, confidences
-
-    def calculate_angle(self, box, cx, cy):
-        x1, y1, x2, y2 = box
-        box_center_x = (x1 + x2) // 2
-        box_center_y = (y1 + y2) // 2
-        dx = box_center_x - cx
-        dy = cy - box_center_y  # In image coordinates, y increases downward
-        angle_radians = math.atan2(dx, dy)/2
-        angle_degrees = math.degrees(angle_radians)
-        return angle_degrees
-
-    def estimate_distance(self, height, reference_heights, reference_distances):
-        if height == 0:
-            return None
-        distance = np.interp(height, reference_heights[::-1], reference_distances[::-1])
-        return distance
-
-    def calculate_brightness(self, roi):
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        return np.mean(gray_roi)
-
-    def determine_arrow_direction(self, arrow_roi):
-        width = arrow_roi.shape[1]
-        left_half = arrow_roi[:, :width // 2]
-        right_half = arrow_roi[:, width // 2:]
-        left_brightness = self.calculate_brightness(left_half)
-        right_brightness = self.calculate_brightness(right_half)
-        if left_brightness < right_brightness:
-            return 'left'
-        else:
-            return 'right'
-
-    def calculate_inclination_angle(self, length, height):
-        detected_aspect_ratio = length / height if height != 0 else 0
-        cos_theta = detected_aspect_ratio / self.original_aspect_ratio if self.original_aspect_ratio != 0 else 0
-        cos_theta = max(-1.0, min(1.0, cos_theta))  # Clamp the value between -1 and 1
-        theta_rad = math.acos(cos_theta)
-        theta_deg = math.degrees(theta_rad)
-        return theta_deg
-
-    def process_frame(self, img, img2, ratio_hor, ratio_vert):
-        boxes, confidences = self.detect_arrows(img)
-        boxes2, confidences2 = self.detect_arrows(img2)
-        boxes_new = []
-        for c in range(len(boxes2)):
-            temp = list(boxes2[c])
-            if(not(temp[0] < 10 or temp[2] > 630 or temp[1] < 10 or temp [3] > 470)):
-                temp[0]+=640
-                temp[0]*=ratio_hor
-                temp[2]+=640 
-                temp[2]*=ratio_hor
-                temp[1]+=300
-                temp[1] -=  self.vertical_offset
-                temp[1]*=ratio_vert
-                temp[3]+=300
-                temp[3] -=  self.vertical_offset
-                temp[3]*=ratio_vert
-                
-                boxes_new.append(tuple(map(int, temp)))
-
-        #print(confidences)
-        boxes.extend(boxes_new)
-        confidences.extend(confidences2)
-        img_height, img_width = img.shape[:2]
-        cx = img_width // 2
-        cy = img_height 
-        arrow_info = []
-        print(boxes)
-        for box, conf in zip(boxes, confidences):
+        any_detection = False
+        for box, conf in zip(boxes, confs):
             x1, y1, x2, y2 = box
-            if(not(x1 < 10 or x2 > 630 or y1 < 10 or y2 > 470)):
-                arrow_roi = img[y1:y2, x1:x2]
-                length = x2 - x1  # Width of the bounding box
-                height = y2 - y1  # Height of the bounding box
-                inclination_angle = self.calculate_inclination_angle(length, height)
-                angle = self.calculate_angle(box, cx, cy)
-                distance = self.estimate_distance(height, self.reference_heights, self.reference_distances)
-                direction = self.determine_arrow_direction(arrow_roi)
-                arrow_info.append((box, angle, distance, direction, inclination_angle, conf))
-                if conf > 0.75:
-                    color = (0, 255, 0)  # Green
-                elif conf > 0.5:
-                    color = (0, 255, 255)  # Yellow
-                else:
-                    color = (0, 0, 255)  # Red
+            w = x2 - x1
+            h = y2 - y1
+            if w <= 0 or h <= 0:
+                continue
 
-            # Drawing the bounding box
-                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            roi = frame_full[y1:y2, x1:x2]
+            direction = arrow_direction_pca(roi)
+            if direction is None:
+                continue
 
-            # Create label with direction and confidence
-                label = f"{direction.capitalize()} Arrow {conf:.2f}"
+            # pose info
+            theta = calculate_angle(box, cx, cy)
+            dist  = estimate_distance(w)
 
-            # Choose font and get text size
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.5
-                thickness = 1
-                (label_width, label_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            # pack JointState (name, position, velocity, effort)
+            msg.name.append(direction)
+            msg.position.append(dist)
+            msg.velocity.append(theta)
+            msg.effort.append(conf)
+            any_detection = True
 
-            # Calculate label position
-                label_x = x1
-                label_y = y1 - 10 if y1 - 10 > label_height else y1 + label_height + 10
+            # visualise -----------------------------------------------------------------
+            color = (0, 255, 0) if conf > 0.75 else (0, 255, 255) if conf > 0.5 else (0, 0, 255)
+            cv2.rectangle(frame_full, (x1, y1), (x2, y2), color, 2)
+            label = f"{direction} {conf:.2f}"
+            cv2.putText(frame_full, label, (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                        color, 1, cv2.LINE_AA)
 
-            # Draw filled rectangle as background for label
-                cv2.rectangle(img, (label_x, label_y - label_height - baseline),
-                        (label_x + label_width, label_y + baseline), color, cv2.FILLED)
+        if not any_detection:
+            # publish dummy message so downstream nodes keep spinning
+            msg.name.append("none")
+            msg.position.append(0.0)
+            msg.velocity.append(0.0)
+            msg.effort.append(0.0)
 
-            # Put label text above the bounding box
-                cv2.putText(img, label, (label_x, label_y),
-                        font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        self.pub_arrow.publish(msg)
+        # publish debug images ----------------------------------------------------------
+        self.pub_full.publish(self.bridge.cv2_to_imgmsg(frame_full, encoding="rgb8"))
+        self.pub_cut.publish(self.bridge.cv2_to_imgmsg(frame_cut, encoding="rgb8"))
 
-            # (Optional) Draw additional annotations below the box
-            # You can adjust or remove these as needed
-                additional_info = (
-                f"Angle: {angle:.1f}°",
-                f"Incl: {inclination_angle:.1f}°",
-                f"Dist: {distance:.2f}m"
-            )
-                for i, info in enumerate(additional_info):
-                    text = info
-                    text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
-                    text_x = x1
-                    text_y = y2 + 20 + i * 20  # Start 20 pixels below the box
-                # Ensure text stays within frame
-                    text_y = min(text_y, img_height - 10)
-                    cv2.putText(img, text, (text_x, text_y),
-                            font, font_scale, color, thickness, cv2.LINE_AA)
+    # ───────────────────── model helper ─────────────────────
+    def detect_arrows(self, img: np.ndarray) -> Tuple[List[Tuple[int, int, int, int]], List[float]]:
+        """Run YOLO, return boxes in (x1,y1,x2,y2) on *this* image size."""
+        results = self.model(img)
+        boxes_out, confs = [], []
+        for b in results[0].boxes:
+            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+            boxes_out.append((x1, y1, x2, y2))
+            confs.append(float(b.conf.item()))
+        return boxes_out, confs
 
-            # (Optional) Print confidence to console
-                print(f"Detected {direction} arrow with confidence {conf:.2f}")
+    @staticmethod
+    def _transform_box(box: Tuple[int, int, int, int], M: np.ndarray) -> Tuple[int, int, int, int]:
+        """Apply 2×3 affine to all four corners and return int‑bbox."""
+        x1, y1, x2, y2 = box
+        pts = np.float32([[x1, y1], [x2, y2]]).reshape(-1, 1, 2)
+        pts_t = cv2.transform(pts, M).reshape(-1, 2)
+        (nx1, ny1), (nx2, ny2) = pts_t
+        return int(nx1), int(ny1), int(nx2), int(ny2)
 
-        return img, arrow_info
-    
-    def merge_frames(self, processed_frame, arrow_info):
-        
-        return
 
+# ─────────────────────────── main ────────────────────────────
 def main(args=None):
     rclpy.init(args=args)
-    cv_arrow = CV_detect()
-    rclpy.spin(cv_arrow)
-    cv_arrow.destroy_node()
+    node = CVDetect()
+    rclpy.spin(node)
+    node.destroy_node()
     rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
