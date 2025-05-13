@@ -60,12 +60,14 @@ def arrow_direction_pca(roi: np.ndarray) -> Optional[str]:
 
     # --- pick the thinner extreme as arrow head --------------------------
     def local_width(p):
-        strip  = np.abs(((pts - p) @ long_ax)) < 4.0        # 4-px strip
-        return np.ptp((pts[strip] - p) @ ortho)             # spread ⟂ axis
+        strip = np.abs(((pts - p) @ long_ax)) < 4.0
+        if not strip.any():
+            return 1e9               # huge width → never picked as tip
+        return np.ptp((pts[strip] - p) @ ortho)
 
     tip  = p_min if local_width(p_min) < local_width(p_max) else p_max
     tail = p_max if tip is p_min else p_min
-    return "right" if tip[0] > tail[0] else "left
+    return "right" if tip[0] > tail[0] else "left"
 
 
 def estimate_distance(width_px: int, fx_pix: float = FX_PIX,
