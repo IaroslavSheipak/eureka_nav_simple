@@ -65,7 +65,7 @@ def arrow_direction_pca(roi: np.ndarray) -> Optional[str]:
 
     tip  = p_min if local_width(p_min) < local_width(p_max) else p_max
     tail = p_max if tip is p_min else p_min
-    return "right" if tip[0] > tail[0] else "lef
+    return "right" if tip[0] > tail[0] else "left
 
 
 def estimate_distance(width_px: int, fx_pix: float = FX_PIX,
