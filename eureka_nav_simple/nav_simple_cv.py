@@ -44,24 +44,28 @@ PUB_BOX_CUT  = "arrow_box_cut/image_raw"
 # ───────────────────── Geometry helpers ───────────────────────
 
 def arrow_direction_pca(roi: np.ndarray) -> Optional[str]:
-    """Return 'left' or 'right' by locating the arrowhead via PCA.
-    Works if the arrow is within ±45° yaw. Returns None if uncertain."""
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, bw = cv2.threshold(gray, 0, 255,
-                          cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    _, bw  = cv2.threshold(gray, 0, 255,
+                           cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not cnts:
         return None
+    pts          = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+    mean, evecs  = cv2.PCACompute(pts, mean=None)
+    long_ax, ortho = evecs                # major / minor axes (unit vectors)
 
-    cnt = max(cnts, key=cv2.contourArea)
-    pts = cnt.reshape(-1, 2).astype(np.float32)
-    mean, eigvecs = cv2.PCACompute(pts, mean=None)
-    axis = eigvecs[0]  # major axis
+    proj         = (pts - mean) @ long_ax # 1-D coordinate along major axis
+    i_min, i_max = np.argmin(proj), np.argmax(proj)
+    p_min, p_max = pts[i_min], pts[i_max]
 
-    proj = (pts - mean) @ axis  # 1‑D projection onto major axis
-    tail_pt = pts[np.argmin(proj)]
-    tip_pt  = pts[np.argmax(proj)]
-    return "right" if tip_pt[0] > tail_pt[0] else "left"
+    # --- pick the thinner extreme as arrow head --------------------------
+    def local_width(p):
+        strip  = np.abs(((pts - p) @ long_ax)) < 4.0        # 4-px strip
+        return np.ptp((pts[strip] - p) @ ortho)             # spread ⟂ axis
+
+    tip  = p_min if local_width(p_min) < local_width(p_max) else p_max
+    tail = p_max if tip is p_min else p_min
+    return "right" if tip[0] > tail[0] else "lef
 
 
 def estimate_distance(width_px: int, fx_pix: float = FX_PIX,
