@@ -1,18 +1,7 @@
 #!/usr/bin/env python3
 """
-Updated arrow‑detection node for Lucid Triton TRI016S‑CC.
-Changes v2 – May 2025
-─────────────────────
-1.  Geometry‑based left/right using PCA (no brightness heuristics)
-2.  Correct angle calculation (removed extra “/2”)
-3.  Pin‑hole distance estimate → replace lookup table
-4.  Cleaner affine remap for cut‑out detections
-5.  Minor safety fixes (no‑detection message, dtype casts)
-
-⚠️ TODOs before flight
-    •  Set `FX_PIX` to your calibrated focal length in pixels.
-    •  Set `ARROW_WIDTH_M` to the physical arrow width in metres.
-    •  Train your YOLO model (weights path below).
+Arrow detection node with CALIBRATED distance measurement.
+Uses piecewise linear interpolation from lookup table.
 """
 
 import math
@@ -28,29 +17,36 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState, Image
 from cv_bridge import CvBridge
 
-# ─────────────────────────────────────────────────────────────
-# v3 Updates (2025-10-25): Added NMS, confidence filtering, and
-# box size validation. Tested: 9-25% false positive reduction.
-# ─────────────────────────────────────────────────────────────
+# Import calibration configuration
+from calibration_config import (
+    get_distance_from_pixels,
+    get_angle_from_position,
+    SHOW_PIXEL_WIDTH,
+    SHOW_PIXEL_HEIGHT,
+    SHOW_CALIBRATION_STATUS,
+    TEXT_COLOR_CALIBRATED,
+    TEXT_COLOR_EXTRAPOLATED,
+    TEXT_COLOR_OUT_OF_RANGE,
+    validate_calibration_table
+)
 
 # ───────────────────────── Constants ──────────────────────────
-ARROW_WIDTH_M = 0.15            # ← set to real width of plywood arrow (metres)
-FX_PIX        = 920.0           # ← camera focal length (pixels) from calibration
-WEIGHTS_PATH  = Path("./weights/best.pt")
+WEIGHTS_PATH = Path("./weights/best.pt")
 
-# Camera‑specific offsets (vertical cut‑out centre shift)
-VERTICAL_OFFSET = 60            # px – empirical
+# Camera‑specific offsets
+VERTICAL_OFFSET = 60
 
-# Detection filtering parameters (tested 2025-10-25)
-CONF_THRESHOLD    = 0.5         # minimum confidence for valid detections
-NMS_IOU_THRESHOLD = 0.4         # IoU threshold for non-maximum suppression
-MIN_BOX_SIZE      = 20          # minimum box width/height (pixels)
-MAX_BOX_SIZE      = 600         # maximum box width/height (pixels)
+# Detection filtering parameters
+CONF_THRESHOLD = 0.5
+NMS_IOU_THRESHOLD = 0.4
+MIN_BOX_SIZE = 20
+MAX_BOX_SIZE = 600
 
 # Output topic names
-PUB_ARROW   = "arrow_detection"
+PUB_ARROW = "arrow_detection"
 PUB_BOX_FULL = "arrow_box_full/image_raw"
-PUB_BOX_CUT  = "arrow_box_cut/image_raw"
+PUB_BOX_CUT = "arrow_box_cut/image_raw"
+
 
 # ───────────────────── Geometry helpers ───────────────────────
 
@@ -75,7 +71,7 @@ def arrow_direction_pca(roi: np.ndarray) -> Optional[str]:
 
     # PCA to find major axis
     mean, evecs = cv2.PCACompute(pts, mean=None)
-    long_ax, ortho = evecs  # major / minor axes
+    long_ax, ortho = evecs
 
     proj = (pts - mean) @ long_ax
     i_min, i_max = np.argmin(proj), np.argmax(proj)
@@ -83,7 +79,7 @@ def arrow_direction_pca(roi: np.ndarray) -> Optional[str]:
 
     votes = []
 
-    # Heuristic 1: Mass distribution (tip side has MORE mass due to arrowhead)
+    # H1: Mass distribution (tip has MORE mass due to arrowhead)
     left_side = pts[pts[:, 0] < mean[0, 0]]
     right_side = pts[pts[:, 0] >= mean[0, 0]]
 
@@ -93,7 +89,7 @@ def arrow_direction_pca(roi: np.ndarray) -> Optional[str]:
         else:
             votes.append('right')
 
-    # Heuristic 2: Width gradient (tip side shows width increase)
+    # H2: Width gradient (tip shows width increase)
     num_samples = 5
     proj_sorted = np.sort(proj)
     widths = []
@@ -109,11 +105,11 @@ def arrow_direction_pca(roi: np.ndarray) -> Optional[str]:
         x = np.arange(len(widths))
         slope = np.polyfit(x, widths, 1)[0]
         if slope > 0:
-            votes.append('right')  # width increases toward right
+            votes.append('right')
         else:
             votes.append('left')
 
-    # Heuristic 3: Pointiness (find most acute angle)
+    # H3: Pointiness (find most acute angle)
     hull = cv2.convexHull(pts.astype(np.int32), returnPoints=True)
     hull_pts = hull.reshape(-1, 2).astype(np.float32)
 
@@ -150,46 +146,18 @@ def arrow_direction_pca(roi: np.ndarray) -> Optional[str]:
     return 'left' if left_votes > right_votes else 'right'
 
 
-def estimate_distance(width_px: int, fx_pix: float = FX_PIX,
-                      arrow_width_m: float = ARROW_WIDTH_M) -> float:
-    """Pin‑hole camera model: Z = f * W / w."""
-    if width_px <= 0:
-        return float('inf')
-    return (fx_pix * arrow_width_m) / width_px
-
-
-def calculate_angle(box: Tuple[int, int, int, int],
-                    cx: int, cy: int) -> float:
-    """
-    Calculate horizontal angle from camera center to arrow.
-    Uses camera pinhole model: angle = atan(pixel_offset / focal_length)
-
-    Returns:
-        Angle in degrees. Positive = right, Negative = left
-    """
-    x1, y1, x2, y2 = box
-    bx = (x1 + x2) / 2
-    # Horizontal pixel offset from camera center
-    pixel_offset = bx - cx
-    # Horizontal angle using pinhole model
-    angle_rad = math.atan(pixel_offset / FX_PIX)
-    return math.degrees(angle_rad)
-
-
 def compute_iou(box1: Tuple[int, int, int, int],
                 box2: Tuple[int, int, int, int]) -> float:
     """Compute Intersection over Union between two boxes."""
     x1_1, y1_1, x2_1, y2_1 = box1
     x1_2, y1_2, x2_2, y2_2 = box2
 
-    # Intersection area
     xi1 = max(x1_1, x1_2)
     yi1 = max(y1_1, y1_2)
     xi2 = min(x2_1, x2_2)
     yi2 = min(y2_1, y2_2)
     inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
 
-    # Union area
     box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
     box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
     union_area = box1_area + box2_area - inter_area
@@ -204,19 +172,15 @@ def non_maximum_suppression(boxes: List[Tuple[int, int, int, int]],
     if not boxes:
         return [], []
 
-    # Sort by confidence (descending)
     sorted_indices = sorted(range(len(confs)), key=lambda i: confs[i], reverse=True)
-
     keep_boxes = []
     keep_confs = []
 
     while sorted_indices:
-        # Take the box with highest confidence
         idx = sorted_indices[0]
         keep_boxes.append(boxes[idx])
         keep_confs.append(confs[idx])
 
-        # Remove boxes with high IoU overlap
         remaining = []
         for other_idx in sorted_indices[1:]:
             iou = compute_iou(boxes[idx], boxes[other_idx])
@@ -234,7 +198,6 @@ def filter_boxes(boxes: List[Tuple[int, int, int, int]],
     filtered_boxes = []
     filtered_confs = []
 
-    # Filter by confidence and size
     for box, conf in zip(boxes, confs):
         x1, y1, x2, y2 = box
         w = x2 - x1
@@ -246,7 +209,6 @@ def filter_boxes(boxes: List[Tuple[int, int, int, int]],
             filtered_boxes.append(box)
             filtered_confs.append(conf)
 
-    # Apply NMS
     if filtered_boxes:
         filtered_boxes, filtered_confs = non_maximum_suppression(
             filtered_boxes, filtered_confs, NMS_IOU_THRESHOLD
@@ -260,10 +222,17 @@ class CVDetect(Node):
     def __init__(self):
         super().__init__("detect_arrow")
 
+        # Validate calibration on startup
+        valid, message = validate_calibration_table()
+        if not valid:
+            self.get_logger().warn(f"Calibration validation: {message}")
+        else:
+            self.get_logger().info(f"Calibration loaded: {message}")
+
         # Publishers
         self.pub_arrow = self.create_publisher(JointState, PUB_ARROW, 10)
-        self.pub_full  = self.create_publisher(Image, PUB_BOX_FULL, 10)
-        self.pub_cut   = self.create_publisher(Image, PUB_BOX_CUT, 10)
+        self.pub_full = self.create_publisher(Image, PUB_BOX_FULL, 10)
+        self.pub_cut = self.create_publisher(Image, PUB_BOX_CUT, 10)
 
         # Subscriber
         self.sub_image = self.create_subscription(Image, "/arena_camera/images",
@@ -272,24 +241,23 @@ class CVDetect(Node):
         # ML model
         self.model = YOLO(str(WEIGHTS_PATH))
 
-        # frame dispatcher
+        # Frame dispatcher
         self.timer = self.create_timer(0.0, self.process)
 
-        # misc
+        # Misc
         self.bridge = CvBridge()
         self.frame: Optional[np.ndarray] = None
 
-    # ─────────────────── Subscribers / Callbacks ────────────
     def image_callback(self, msg: Image):
         self.frame = self.bridge.imgmsg_to_cv2(msg)
 
     def process(self):
         if self.frame is None:
-            return  # no frame yet
+            return
 
-        frame_full = cv2.resize(self.frame, (640, 480))  # preview size
+        frame_full = cv2.resize(self.frame, (640, 480))
 
-        # ---- build the central cut‑out (square) ---------------------------
+        # Build central cut‑out
         h_full, w_full = self.frame.shape[:2]
         cut_w = 640
         cut_h = 480
@@ -297,11 +265,11 @@ class CVDetect(Node):
         y0 = int(h_full / 2 - cut_h / 2 - VERTICAL_OFFSET)
         frame_cut = self.frame[y0:y0 + cut_h, x0:x0 + cut_w]
 
-        # ---- run YOLO on both views --------------------------------------
+        # Run YOLO on both views
         boxes_full, confs_full = self.detect_arrows(frame_full)
-        boxes_cut, confs_cut   = self.detect_arrows(frame_cut)
+        boxes_cut, confs_cut = self.detect_arrows(frame_cut)
 
-        # map cut‑coords → full‑coords via affine (translation then scaling)
+        # Map cut‑coords → full‑coords
         Sx = 640 / w_full
         Sy = 480 / h_full
         M = np.array([[Sx, 0, x0 * Sx], [0, Sy, y0 * Sy]], dtype=np.float32)
@@ -310,11 +278,11 @@ class CVDetect(Node):
         boxes = boxes_full + boxes_cut_global
         confs = confs_full + confs_cut
 
-        # ---- apply filtering: confidence, size, NMS -----------------------
+        # Apply filtering
         boxes, confs = filter_boxes(boxes, confs)
 
-        # camera centre (for angle)
-        cx = 320  # because frame_full is 640×480
+        # Camera centre
+        cx = 320
         cy = 240
 
         msg = JointState()
@@ -333,37 +301,73 @@ class CVDetect(Node):
             if direction is None:
                 continue
 
-            # pose info
-            theta = calculate_angle(box, cx, cy)
-            dist  = estimate_distance(w)
+            # CALIBRATED distance measurement
+            bx = (x1 + x2) / 2
+            dist, status = get_distance_from_pixels(w, h, use_width=True)
 
-            # pack JointState (name, position, velocity, effort)
+            # CALIBRATED angle measurement
+            theta = get_angle_from_position(bx, cx)
+
+            # Pack JointState
             msg.name.append(direction)
             msg.position.append(dist)
             msg.velocity.append(theta)
             msg.effort.append(conf)
             any_detection = True
 
-            # visualise -----------------------------------------------------------------
-            color = (0, 255, 0) if conf > 0.75 else (0, 255, 255) if conf > 0.5 else (0, 0, 255)
+            # Visualize with PIXEL MEASUREMENTS
+            color = self._get_color_for_status(status, conf)
+
             cv2.rectangle(frame_full, (x1, y1), (x2, y2), color, 2)
-            label = f"{direction} {conf:.2f}"
-            cv2.putText(frame_full, label, (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-                        color, 1, cv2.LINE_AA)
+
+            # Main label
+            label = f"{direction} {conf:.2f}"
+            cv2.putText(frame_full, label, (x1, y1 - 6),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 1, cv2.LINE_AA)
+
+            # Distance and angle
+            info_text = f"D:{dist:.2f}m A:{theta:.1f}deg"
+            cv2.putText(frame_full, info_text, (x1, y2 + 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+            # PIXEL MEASUREMENTS (for exhibition/calibration)
+            pixel_y = y1 + 15
+            if SHOW_PIXEL_WIDTH:
+                text = f"W:{w}px"
+                cv2.putText(frame_full, text, (x1, pixel_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
+                pixel_y += 18
+
+            if SHOW_PIXEL_HEIGHT:
+                text = f"H:{h}px"
+                cv2.putText(frame_full, text, (x1, pixel_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
+                pixel_y += 18
+
+            if SHOW_CALIBRATION_STATUS:
+                status_short = status[:4] if len(status) > 4 else status
+                cv2.putText(frame_full, status_short, (x1, pixel_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
 
         if not any_detection:
-            # publish dummy message so downstream nodes keep spinning
             msg.name.append("none")
             msg.position.append(0.0)
             msg.velocity.append(0.0)
             msg.effort.append(0.0)
 
         self.pub_arrow.publish(msg)
-        # publish debug images ----------------------------------------------------------
         self.pub_full.publish(self.bridge.cv2_to_imgmsg(frame_full, encoding="rgb8"))
         self.pub_cut.publish(self.bridge.cv2_to_imgmsg(frame_cut, encoding="rgb8"))
 
-    # ───────────────────── model helper ─────────────────────
+    def _get_color_for_status(self, status: str, conf: float):
+        """Get visualization color based on calibration status."""
+        if status == "calibrated":
+            return TEXT_COLOR_CALIBRATED
+        elif status.startswith("extrapolated"):
+            return TEXT_COLOR_EXTRAPOLATED
+        else:
+            return TEXT_COLOR_OUT_OF_RANGE
+
     def detect_arrows(self, img: np.ndarray) -> Tuple[List[Tuple[int, int, int, int]], List[float]]:
         """Run YOLO, return boxes in (x1,y1,x2,y2) on *this* image size."""
         results = self.model(img)
@@ -384,7 +388,6 @@ class CVDetect(Node):
         return int(nx1), int(ny1), int(nx2), int(ny2)
 
 
-# ─────────────────────────── main ────────────────────────────
 def main(args=None):
     rclpy.init(args=args)
     node = CVDetect()
