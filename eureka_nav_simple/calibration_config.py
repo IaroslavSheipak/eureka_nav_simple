@@ -25,7 +25,9 @@ CALIBRATION_DISTANCES = np.arange(MIN_DISTANCE_M, MAX_DISTANCE_M + DISTANCE_STEP
 
 # Format: (distance_meters, pixel_width, pixel_height)
 # EXAMPLE DATA - REPLACE WITH YOUR ACTUAL MEASUREMENTS
-CALIBRATION_TABLE = [
+
+# ARROW CALIBRATION TABLE
+CALIBRATION_TABLE_ARROWS = [
     # Distance(m), Width(px), Height(px)
     (1.0,  138,  104),   # Arrow at 1 meter
     (2.0,   69,   52),   # Arrow at 2 meters
@@ -38,6 +40,25 @@ CALIBRATION_TABLE = [
     (9.0,   15,   11),   # Arrow at 9 meters
     (10.0,  14,   10),   # Arrow at 10 meters
 ]
+
+# CONE CALIBRATION TABLE
+# Cones are typically narrower and taller than arrows
+CALIBRATION_TABLE_CONES = [
+    # Distance(m), Width(px), Height(px)
+    (1.0,  80,  160),   # Cone at 1 meter
+    (2.0,  40,   80),   # Cone at 2 meters
+    (3.0,  27,   53),   # Cone at 3 meters
+    (4.0,  20,   40),   # Cone at 4 meters
+    (5.0,  16,   32),   # Cone at 5 meters
+    (6.0,  13,   27),   # Cone at 6 meters
+    (7.0,  11,   23),   # Cone at 7 meters
+    (8.0,  10,   20),   # Cone at 8 meters
+    (9.0,   9,   18),   # Cone at 9 meters
+    (10.0,  8,   16),   # Cone at 10 meters
+]
+
+# Default table for backward compatibility (arrows)
+CALIBRATION_TABLE = CALIBRATION_TABLE_ARROWS
 
 # Note: These are EXAMPLE values based on theoretical calculation
 # YOU MUST REPLACE with actual measured values from your camera!
@@ -68,7 +89,7 @@ TEXT_COLOR_OUT_OF_RANGE = (0, 0, 255)    # Red for out of range
 # ═══════════════════════════════════════════════════════════════════
 
 def get_distance_from_pixels(pixel_width: float, pixel_height: float,
-                             use_width: bool = True) -> Tuple[float, str]:
+                             use_width: bool = True, object_type: str = "arrow") -> Tuple[float, str]:
     """
     Convert pixel measurement to distance using piecewise linear interpolation.
 
@@ -76,19 +97,29 @@ def get_distance_from_pixels(pixel_width: float, pixel_height: float,
         pixel_width: Width of bounding box in pixels
         pixel_height: Height of bounding box in pixels
         use_width: If True, use width for interpolation; else use height
+        object_type: Type of object ("arrow" or "cone") to select calibration table
 
     Returns:
         (distance_meters, status_string)
         status: "calibrated", "extrapolated_near", "extrapolated_far", "out_of_range"
     """
-    if not CALIBRATION_TABLE:
+    # Select appropriate calibration table based on object type
+    if object_type == "cone":
+        calibration_table = CALIBRATION_TABLE_CONES
+        # For cones, prefer height over width
+        if use_width is True:  # If not explicitly set, use height for cones
+            use_width = False
+    else:
+        calibration_table = CALIBRATION_TABLE_ARROWS
+
+    if not calibration_table:
         # Fallback to theoretical formula if no calibration data
         return get_distance_theoretical(pixel_width), "uncalibrated"
 
     # Extract calibration data
-    distances = np.array([entry[0] for entry in CALIBRATION_TABLE])
-    widths = np.array([entry[1] for entry in CALIBRATION_TABLE])
-    heights = np.array([entry[2] for entry in CALIBRATION_TABLE])
+    distances = np.array([entry[0] for entry in calibration_table])
+    widths = np.array([entry[1] for entry in calibration_table])
+    heights = np.array([entry[2] for entry in calibration_table])
 
     # Choose which measurement to use
     pixels = pixel_width if use_width else pixel_height
